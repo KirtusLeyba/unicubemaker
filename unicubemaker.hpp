@@ -18,6 +18,9 @@
 *
 */
 
+//** TODO: 05/06/2024 it looks like FCC will need its own special implementation because (with 1 cell thick boundary)
+//**                  each process will have a different shape ghost buffer and whatnot
+
 #include <upcxx/upcxx.hpp>
 
 struct Constraints {
@@ -64,4 +67,21 @@ template <typename T> void MemoryHandler<T>::allocate(){
 
 template <typename T> void MemoryHandler<T>::allocate(){
     
+}
+
+/**
+* Determine the simulation space constrains using the specified dimensions
+* int sx, sy, sz: the dimensions in simulation space of the entire simulation
+*   in terms of the max extent of points in each dimension, not necessarily the count
+*   this allowes for diverse point topologies
+* int rx, ry, rz: the dimensions in simulation space of the ranks
+*   (2, 2, 3) = 2 ranks in x, 2 in y, 3 in z, for example
+**/
+Constraints computeConstraints(int sx, int sy, int sz,
+                                int rx, int ry, int rz){
+    Constraints cons;
+
+    
+
+    return cons;
 }
