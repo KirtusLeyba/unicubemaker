@@ -23,65 +23,68 @@
 
 #include <upcxx/upcxx.hpp>
 
-struct Constraints {
-    // the full dimensions of simulation space, IS NOT accounting for ghost voxels
-    int fullX, fullY, fullZ, fullSize;
-    // the local dimensions of simulation space, owned by this process, IS NOT accounting for ghost voxels
-    int localX, localY, localZ, localSize;
-    // the local dimensions of the simulation space, owned by this process, IS accounting for ghost voxels
-    int memX, memY, memZ, memSize;
+template <typename T> struct DataNode {
+    int numNeighbors;
+    DataNode* neighbors;
+    bool ghost;
+    T data;
 };
 
-template <typename T> class MemoryHandler {
+template <typename T> class ProcessNode {
     public:
-    MemoryHandler(Constraints cons);
-    ~MemoryHandler();
-    
-    private:
-    void allocate();
-    void deallocate();
+    void initComms();
+    void gatherGhosts();
 
     public:
     //data fields are public because the expectation
     //is that the data will interact with various kernels,
     //so it is exposed for easy access
-    upcxx::dist_object< upcxx::global_ptr<T> > distData;
+    upcxx::global_ptr<DataNode<T>> data;
+    std::vector<upcxx::global_ptr<DataNode<T>>> neighborSendData; //global_ptrs to neighbor data
+    std::vector<upcxx::global_ptr<DataNode<T>>> neighborRecvData; //copy to here and unpack
+    std::vector<upcxx::global_ptr<DataNode<T>>> sendData; //pack here (neighborSendData according to other processes)
+    std::vector<size_t> neighborBufferSizes;
 
+    //maps used for unpacking received data
+    std::vector<std::vector<int>> bufferMaps;
     
-
     private:
-        Constraints m_Cons;
+    unsigned int numNeighbors;
+    std::vector<int> neighborIDs;
+
 };
 
-template <typename T> MemoryHandler<T>::MemoryHandler(Constraints cons){
-    m_Cons = cons;
+void ProcessNode::initComms(){
+    //send sendData global_pointer to neighbor processes' neighborSendData fields
+    //TODO: Make this put the gptrs in the correct order, either use a map or start with a vector full of null_ptrs
+    for(unsigned int i = 0; i < numNeighbors; i++){
+        upcxx::rpc(neighborIDs[i],
+                    [](upcxx::global_ptr<DataNode<T>> gptr){
+                neighborSendData.push_back(gptr);
+            }, sendData[i]).wait();
+    }
+    upcxx::barrier();
 }
 
-template <typename T> MemoryHandler<T>::~MemoryHandler(){
-    return; //TODO
-}
+void ProcessNode::gatherGhosts(){
+    upcxx::barrier(); //ensures all processes have packed data into sendData
 
-template <typename T> void MemoryHandler<T>::allocate(){
-    
-}
+    //receive data from neighbors
+    upcxx::future<> futureAll = upcxx::make_future();
+    for(unsigned int i = 0; i < numNeighbors; i++){
+        upcxx::future<> f = upcxx::copy(neighborSendData[i], neighborRecvData[i], neighborBufferSizes[i]);
+        futureAll = upcxx::when_all(futureAll, f);
+    }
+    futureAll.wait();
 
-template <typename T> void MemoryHandler<T>::allocate(){
-    
-}
+    //distribute data to correct DataNodes
+    auto localData = data.local();
+    for(unsigned int i = 0; i < numNeighbors; i++){
+        for(unsigned int j = 0; j < bufferMaps[i].size(); j++){
+            int localIDX = bufferMaps[i][j];
+            localData[localIDX] = neighborRecvData[i][j];
+        }
+    }
 
-/**
-* Determine the simulation space constrains using the specified dimensions
-* int sx, sy, sz: the dimensions in simulation space of the entire simulation
-*   in terms of the max extent of points in each dimension, not necessarily the count
-*   this allowes for diverse point topologies
-* int rx, ry, rz: the dimensions in simulation space of the ranks
-*   (2, 2, 3) = 2 ranks in x, 2 in y, 3 in z, for example
-**/
-Constraints computeConstraints(int sx, int sy, int sz,
-                                int rx, int ry, int rz){
-    Constraints cons;
-
-    
-
-    return cons;
+    upcxx::barrier();
 }
