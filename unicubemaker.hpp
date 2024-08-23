@@ -21,6 +21,8 @@
 //** TODO: 05/06/2024 it looks like FCC will need its own special implementation because (with 1 cell thick boundary)
 //**                  each process will have a different shape ghost buffer and whatnot
 
+#include <vector>
+#include <algorithm>
 #include <upcxx/upcxx.hpp>
 
 template <typename T> struct DataNode {
@@ -28,6 +30,7 @@ template <typename T> struct DataNode {
     DataNode* neighbors;
     bool ghost;
     T data;
+    int x,y,z; //spatial coordinates are only relavent in some networks
 };
 
 template <typename T> class ProcessNode {
@@ -56,12 +59,14 @@ template <typename T> class ProcessNode {
 
 void ProcessNode::initComms(){
     //send sendData global_pointer to neighbor processes' neighborSendData fields
-    //TODO: Make this put the gptrs in the correct order, either use a map or start with a vector full of null_ptrs
     for(unsigned int i = 0; i < numNeighbors; i++){
         upcxx::rpc(neighborIDs[i],
-                    [](upcxx::global_ptr<DataNode<T>> gptr){
-                neighborSendData.push_back(gptr);
-            }, sendData[i]).wait();
+                    [&](upcxx::global_ptr<DataNode<T>> gptr, int sourceRank){
+                auto it = std::find(this->neighborIDs.begin(),
+                                    this->neighborIDs.end(), sourceRank);
+                int j = *it;   
+                this->neighborSendData[j] = gptr; //NOTE: no push_back, so must be initialized at this point
+            }, sendData[i], upcxx::rank_me()).wait();
     }
     upcxx::barrier();
 }
