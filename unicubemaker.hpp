@@ -21,13 +21,14 @@
 //** TODO: 05/06/2024 it looks like FCC will need its own special implementation because (with 1 cell thick boundary)
 //**                  each process will have a different shape ghost buffer and whatnot
 
+#pragma once
 #include <vector>
 #include <algorithm>
 #include <upcxx/upcxx.hpp>
 
 template <typename T> struct DataNode {
     int numNeighbors;
-    DataNode* neighbors;
+    DataNode** neighbors;
     bool ghost;
     T data;
     int x,y,z; //spatial coordinates are only relavent in some networks
@@ -35,61 +36,79 @@ template <typename T> struct DataNode {
 
 template <typename T> class ProcessNode {
     public:
-    void initComms();
+    void bcastGPTRs();
     void gatherGhosts();
 
+    //TODO: Come back and figure out which fields are safe to make private
     public:
     //data fields are public because the expectation
     //is that the data will interact with various kernels,
     //so it is exposed for easy access
-    upcxx::global_ptr<DataNode<T>> data;
-    std::vector<upcxx::global_ptr<DataNode<T>>> neighborSendData; //global_ptrs to neighbor data
-    std::vector<upcxx::global_ptr<DataNode<T>>> neighborRecvData; //copy to here and unpack
-    std::vector<upcxx::global_ptr<DataNode<T>>> sendData; //pack here (neighborSendData according to other processes)
-    std::vector<size_t> neighborBufferSizes;
+    upcxx::global_ptr<DataNode<T>> m_data;
+
+    //Communication example from process a:
+    //story my data for neighbor i into m_sendData[i];
+    //from neighbor i, a call is initiated where j is the idx process i according to process j's list of neighbors:
+    //copy( a's m_sendData which is stored in process i in m_neighborSendData, m_neighborRecvData[j] )
+    //unpack m_neighborRecvData[j] -> m_data using bufferMaps
+    std::vector<upcxx::global_ptr<DataNode<T>>> m_neighborSendData; //global_ptrs to neighbor data
+    std::vector<DataNode<T>*> m_neighborRecvData; //copy to here and unpack
+    std::vector<upcxx::global_ptr<DataNode<T>>> m_sendData; //pack here (neighborSendData according to other processes)
+
+    //we are only calling copy from receiving processes, so only need these buffer sizes tracked
+    std::vector<size_t> m_neighborRecvSizes;
 
     //maps used for unpacking received data
-    std::vector<std::vector<int>> bufferMaps;
+    std::vector<std::vector<int>> m_bufferMaps;
+
+    //tracking neighborhood in "process space"
+    unsigned int m_numNeighbors;
+    std::vector<int> m_neighborIDs;
+
+    //we assume the following are initialized prior to a call to bcastGPTRs():
+    //m_data, m_neighborSendData (to null pointers),
+    //m_neighborRecvData (to empty arrays of correct size),
+    //m_sendData (to empty arrays of correct size)
     
-    private:
-    unsigned int numNeighbors;
-    std::vector<int> neighborIDs;
+    //and the following initialized with accurate topology data
+    //m_neighborRecvSizes, bufferMaps, numNeighbors, neighborIDs
 
 };
 
-void ProcessNode::initComms(){
+template <typename T> void ProcessNode<T>::bcastGPTRs(){
     //send sendData global_pointer to neighbor processes' neighborSendData fields
-    for(unsigned int i = 0; i < numNeighbors; i++){
-        upcxx::rpc(neighborIDs[i],
+    for(unsigned int i = 0; i < m_numNeighbors; i++){
+        upcxx::rpc(m_neighborIDs[i],
                     [&](upcxx::global_ptr<DataNode<T>> gptr, int sourceRank){
-                auto it = std::find(this->neighborIDs.begin(),
-                                    this->neighborIDs.end(), sourceRank);
-                int j = *it;   
-                this->neighborSendData[j] = gptr; //NOTE: no push_back, so must be initialized at this point
-            }, sendData[i], upcxx::rank_me()).wait();
+                auto it = std::find(this->m_neighborIDs.begin(),
+                                    this->m_neighborIDs.end(), sourceRank);
+                int j = it - this->m_neighborIDs.begin();   
+                this->m_neighborSendData[j] = gptr;
+                std::cout << "rank " << upcxx::rank_me() << " knows that neighbor " << j << " is rank " << sourceRank << "\n";
+            }, m_sendData[i], upcxx::rank_me()).wait();
     }
     upcxx::barrier();
 }
 
-void ProcessNode::gatherGhosts(){
+template <typename T> void ProcessNode<T>::gatherGhosts(){
     upcxx::barrier(); //ensures all processes have packed data into sendData
 
     //receive data from neighbors
     upcxx::future<> futureAll = upcxx::make_future();
-    for(unsigned int i = 0; i < numNeighbors; i++){
-        upcxx::future<> f = upcxx::copy(neighborSendData[i], neighborRecvData[i], neighborBufferSizes[i]);
+    for(unsigned int i = 0; i < m_numNeighbors; i++){
+        upcxx::future<> f = upcxx::copy(m_neighborSendData[i], m_neighborRecvData[i], m_neighborRecvSizes[i]);
         futureAll = upcxx::when_all(futureAll, f);
     }
     futureAll.wait();
 
     //distribute data to correct DataNodes
-    auto localData = data.local();
-    for(unsigned int i = 0; i < numNeighbors; i++){
-        for(unsigned int j = 0; j < bufferMaps[i].size(); j++){
-            int localIDX = bufferMaps[i][j];
-            localData[localIDX] = neighborRecvData[i][j];
+    auto localData = m_data.local();
+    for(unsigned int i = 0; i < m_numNeighbors; i++){
+        for(unsigned int j = 0; j < m_bufferMaps[i].size(); j++){
+            int localIDX = m_bufferMaps[i][j];
+            localData[localIDX] = m_neighborRecvData[i][j];
+            localData[localIDX].ghost = true;
         }
     }
-
     upcxx::barrier();
 }
