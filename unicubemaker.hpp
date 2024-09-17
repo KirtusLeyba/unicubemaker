@@ -27,11 +27,10 @@
 #include <upcxx/upcxx.hpp>
 
 template <typename T> struct DataNode {
-    int numNeighbors;
-    DataNode** neighbors;
-    bool ghost;
-    T data;
-    int x,y,z; //spatial coordinates are only relavent in some networks
+    int m_num_neighbors;
+    DataNode** m_neighbors;
+    bool m_ghost;
+    T m_data;
 };
 
 template <typename T> class ProcessNode {
@@ -39,53 +38,28 @@ template <typename T> class ProcessNode {
     void bcastGPTRs();
     void gatherGhosts();
 
-    //TODO: Come back and figure out which fields are safe to make private
     public:
-    //data fields are public because the expectation
-    //is that the data will interact with various kernels,
-    //so it is exposed for easy access
-    upcxx::global_ptr<DataNode<T>> m_data;
+    DataNode<T>* m_data;
+    std::vector<upcxx::global_ptr<DataNode<T>>> m_packed_gptrs;
+    std::vector<upcxx::global_ptr<DataNode<T>>> m_neighbor_gptrs;
+    std::vector<size_t> m_neighbor_gptr_sizes;
+    std::vector<std::vector<int>> m_gptr_to_data;
 
-    //Communication example from process a:
-    //story my data for neighbor i into m_sendData[i];
-    //from neighbor i, a call is initiated where j is the idx process i according to process j's list of neighbors:
-    //copy( a's m_sendData which is stored in process i in m_neighborSendData, m_neighborRecvData[j] )
-    //unpack m_neighborRecvData[j] -> m_data using bufferMaps
-    std::vector<upcxx::global_ptr<DataNode<T>>> m_neighborSendData; //global_ptrs to neighbor data
-    std::vector<DataNode<T>*> m_neighborRecvData; //copy to here and unpack
-    std::vector<upcxx::global_ptr<DataNode<T>>> m_sendData; //pack here (neighborSendData according to other processes)
-
-    //we are only calling copy from receiving processes, so only need these buffer sizes tracked
-    std::vector<size_t> m_neighborRecvSizes;
-
-    //maps used for unpacking received data
-    std::vector<std::vector<int>> m_bufferMaps;
-
-    //tracking neighborhood in "process space"
-    unsigned int m_numNeighbors;
-    std::vector<int> m_neighborIDs;
-
-    //we assume the following are initialized prior to a call to bcastGPTRs():
-    //m_data, m_neighborSendData (to null pointers),
-    //m_neighborRecvData (to empty arrays of correct size),
-    //m_sendData (to empty arrays of correct size)
-    
-    //and the following initialized with accurate topology data
-    //m_neighborRecvSizes, bufferMaps, numNeighbors, neighborIDs
+    unsigned int m_num_neighbors;
+    std::vector<int> m_neighbor_ranks;
 
 };
 
 template <typename T> void ProcessNode<T>::bcastGPTRs(){
-    //send sendData global_pointer to neighbor processes' neighborSendData fields
-    for(unsigned int i = 0; i < m_numNeighbors; i++){
-        upcxx::rpc(m_neighborIDs[i],
-                    [&](upcxx::global_ptr<DataNode<T>> gptr, int sourceRank){
-                auto it = std::find(this->m_neighborIDs.begin(),
-                                    this->m_neighborIDs.end(), sourceRank);
-                int j = it - this->m_neighborIDs.begin();   
-                this->m_neighborSendData[j] = gptr;
-                std::cout << "rank " << upcxx::rank_me() << " knows that neighbor " << j << " is rank " << sourceRank << "\n";
-            }, m_sendData[i], upcxx::rank_me()).wait();
+    upcxx::barrier();
+    for(unsigned int i = 0; i < m_num_neighbors; i++){
+        upcxx::rpc(m_neighbor_ranks[i],
+                    [&](upcxx::global_ptr<DataNode<T>> gptr, int source_rank){
+                auto it = std::find(this->m_neighbor_ranks.begin(),
+                                    this->m_neighbor_ranks.end(), source_rank);
+                int j = it - this->m_neighbor_ranks.begin();   
+                this->m_neighbor_gptrs[j] = gptr;
+            }, m_packed_gptrs[i], upcxx::rank_me()).wait();
     }
     upcxx::barrier();
 }
@@ -93,22 +67,29 @@ template <typename T> void ProcessNode<T>::bcastGPTRs(){
 template <typename T> void ProcessNode<T>::gatherGhosts(){
     upcxx::barrier(); //ensures all processes have packed data into sendData
 
+    std::vector<DataNode<T>*> recv_data;
+
     //receive data from neighbors
-    upcxx::future<> futureAll = upcxx::make_future();
-    for(unsigned int i = 0; i < m_numNeighbors; i++){
-        upcxx::future<> f = upcxx::copy(m_neighborSendData[i], m_neighborRecvData[i], m_neighborRecvSizes[i]);
-        futureAll = upcxx::when_all(futureAll, f);
+    upcxx::future<> future_all = upcxx::make_future();
+    for(unsigned int i = 0; i < m_num_neighbors; i++){
+
+        recv_data.push_back(new DataNode<T>[m_neighbor_gptr_sizes[i]]);
+        upcxx::future<> f = upcxx::copy(m_neighbor_gptrs[i], recv_data[i], m_neighbor_gptr_sizes[i]);
+        future_all = upcxx::when_all(future_all, f);
     }
-    futureAll.wait();
+    future_all.wait();
 
     //distribute data to correct DataNodes
-    auto localData = m_data.local();
-    for(unsigned int i = 0; i < m_numNeighbors; i++){
-        for(unsigned int j = 0; j < m_bufferMaps[i].size(); j++){
-            int localIDX = m_bufferMaps[i][j];
-            localData[localIDX] = m_neighborRecvData[i][j];
-            localData[localIDX].ghost = true;
+    for(unsigned int i = 0; i < m_num_neighbors; i++){
+        for(unsigned int j = 0; j < m_gptr_to_data[i].size(); j++){
+            m_data[m_gptr_to_data[i][j]].m_data = recv_data[i][j].m_data;
         }
     }
+
+    //clear temp memory
+    for(unsigned int i = 0; i < m_num_neighbors; i++){
+        delete[] recv_data[i];
+    }
+
     upcxx::barrier();
 }
