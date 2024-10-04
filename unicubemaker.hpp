@@ -18,11 +18,12 @@
 *
 */
 
-//** TODO: 05/06/2024 it looks like FCC will need its own special implementation because (with 1 cell thick boundary)
-//**                  each process will have a different shape ghost buffer and whatnot
+//TODO: 10/04/24, for some setups it is helpful to do communication in waves, and so there needs to be some way
+//to do copies in a specific order from the application side
 
 #pragma once
 #include <vector>
+#include <unordered_map>
 #include <algorithm>
 #include <upcxx/upcxx.hpp>
 
@@ -36,60 +37,65 @@ template <typename T> struct DataNode {
 template <typename T> class ProcessNode {
     public:
     void bcastGPTRs();
-    void gatherGhosts();
+    void recvAndUnpack();
+    void packData();
 
     public:
-    DataNode<T>* m_data;
-    std::vector<upcxx::global_ptr<DataNode<T>>> m_packed_gptrs;
-    std::vector<upcxx::global_ptr<DataNode<T>>> m_neighbor_gptrs;
-    std::vector<size_t> m_neighbor_gptr_sizes;
-    std::vector<std::vector<int>> m_gptr_to_data;
+    DataNode<T>* m_data_nodes;
 
-    unsigned int m_num_neighbors;
-    std::vector<int> m_neighbor_ranks;
-
+    std::unordered_map<int, upcxx::global_ptr<DataNode<T>>> m_packed_data;
+    std::unordered_map<int, size_t> m_packed_data_sizes;
+    std::unordered_map<int, upcxx::global_ptr<DataNode<T>>> m_neighbor_data;
+    std::unordered_map<int, size_t> m_neighbor_data_sizes;
+    std::unordered_map<int, std::vector<int>> m_unpack_map;
+    std::unordered_map<int, std::vector<int>> m_pack_map;
 };
 
 template <typename T> void ProcessNode<T>::bcastGPTRs(){
-    upcxx::barrier();
-    for(unsigned int i = 0; i < m_num_neighbors; i++){
-        upcxx::rpc(m_neighbor_ranks[i],
-                    [&](upcxx::global_ptr<DataNode<T>> gptr, int source_rank){
-                auto it = std::find(this->m_neighbor_ranks.begin(),
-                                    this->m_neighbor_ranks.end(), source_rank);
-                int j = it - this->m_neighbor_ranks.begin();   
-                this->m_neighbor_gptrs[j] = gptr;
-            }, m_packed_gptrs[i], upcxx::rank_me()).wait();
+    for(auto pair : m_packed_data){
+        int process_id = pair.first;
+        upcxx::rpc(process_id,
+                    [&](upcxx::global_ptr<DataNode<T>> gptr, int source_rank, size_t data_size){
+                this->m_neighbor_data[source_rank] = gptr;
+                this->m_neighbor_data_sizes[source_rank] = data_size;
+            }, m_packed_data.at(process_id), upcxx::rank_me(), m_packed_data_sizes.at(process_id)).wait();
     }
-    upcxx::barrier();
 }
 
-template <typename T> void ProcessNode<T>::gatherGhosts(){
-    upcxx::barrier(); //ensures all processes have packed data into sendData
+template <typename T> void ProcessNode<T>::packData(){
+    for(auto pair : m_pack_map){
+        int process_id = pair.first;
+        DataNode<T>* local_packed_data = m_packed_data.at(process_id).local();
+        for(unsigned int i = 0; i < pair.second.size(); i++){
+            local_packed_data[i].m_data = m_data_nodes[pair.second[i]].m_data;
+        }
+    }
+}
 
-    std::vector<DataNode<T>*> recv_data;
-
+template <typename T> void ProcessNode<T>::recvAndUnpack(){
+    std::unordered_map<int, DataNode<T>*> recv_data;
+    
     //receive data from neighbors
     upcxx::future<> future_all = upcxx::make_future();
-    for(unsigned int i = 0; i < m_num_neighbors; i++){
-
-        recv_data.push_back(new DataNode<T>[m_neighbor_gptr_sizes[i]]);
-        upcxx::future<> f = upcxx::copy(m_neighbor_gptrs[i], recv_data[i], m_neighbor_gptr_sizes[i]);
+    for(auto pair : m_neighbor_data){
+        int process_id = pair.first;
+        DataNode<T>* temp_recv = new DataNode<T>[m_neighbor_data_sizes.at(process_id)];
+        upcxx::future<> f = upcxx::copy(m_neighbor_data.at(process_id), temp_recv);
         future_all = upcxx::when_all(future_all, f);
+        recv_data[process_id] = temp_recv;
     }
     future_all.wait();
 
-    //distribute data to correct DataNodes
-    for(unsigned int i = 0; i < m_num_neighbors; i++){
-        for(unsigned int j = 0; j < m_gptr_to_data[i].size(); j++){
-            m_data[m_gptr_to_data[i][j]].m_data = recv_data[i][j].m_data;
+    //unpack recv_data
+    for(auto pair : m_unpack_map){
+        int process_id = pair.first;
+        for(unsigned int i = 0; i < pair.second.size(); i++){
+            m_data_nodes[pair.second[i]].m_data = recv_data[process_id][i].m_data;
         }
     }
 
     //clear temp memory
-    for(unsigned int i = 0; i < m_num_neighbors; i++){
-        delete[] recv_data[i];
+    for(auto pair : recv_data){
+        delete[] pair.second;
     }
-
-    upcxx::barrier();
 }
