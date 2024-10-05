@@ -181,88 +181,87 @@ int main(int argc, char** argv){
                 if(i == rank.my_half_steps.x-1 && rank.nextX) ghost = true;
                 if(j == rank.my_half_steps.y-1 && rank.nextY) ghost = true;
                 if(k == rank.my_half_steps.z-1 && rank.nextZ) ghost = true;
-                if(isPoint(evenX, evenY, evenZ)){
-                    proc_node.m_data_nodes[idx].m_ghost = ghost;
-                    FCCDiffuser data_struct;
-                    data_struct.x = rank.coords_sim_space.x + i;
-                    data_struct.y = rank.coords_sim_space.y + j;
-                    data_struct.z = rank.coords_sim_space.z + k;
-                    data_struct.i = to1D({data_struct.x, data_struct.y, data_struct.z},
-                                         {half_steps_x, half_steps_y, half_steps_z})/2;
-                    data_struct.amount = 0.0f;
-                    proc_node.m_data_nodes[idx].m_data = data_struct;
-                    
-                    //count up number of neighbors
-                    proc_node.m_data_nodes[idx].m_num_neighbors = 0;
-                    for(int dx = -1; dx <= 1; dx++){
-                        for(int dy = -1; dy <= 1; dy++){
-                            for(int dz = -1; dz <= 1; dz++){
-                                int nz = 0;
-                                if(dx == 0) nz++;
-                                if(dy == 0) nz++;
-                                if(dz == 0) nz++;
-                                if(nz == 1){
-                                    Point3D new_point = {proc_node.m_data_nodes[idx].m_data.x + dx,
-                                                         proc_node.m_data_nodes[idx].m_data.y + dy,
-                                                         proc_node.m_data_nodes[idx].m_data.z + dz};
-                                    Point3D local = {new_point.x - rank.coords_sim_space.x,
-                                                     new_point.y - rank.coords_sim_space.y,
-                                                     new_point.z - rank.coords_sim_space.z};
-                                    if(inBounds(local, rank.my_half_steps)){
-                                        proc_node.m_data_nodes[idx].m_num_neighbors++;
-                                    }
+                if(!isPoint(evenX, evenY, evenZ)) continue;
+                proc_node.m_data_nodes[idx].m_ghost = ghost;
+                FCCDiffuser data_struct;
+                data_struct.x = rank.coords_sim_space.x + i;
+                data_struct.y = rank.coords_sim_space.y + j;
+                data_struct.z = rank.coords_sim_space.z + k;
+                data_struct.i = to1D({data_struct.x, data_struct.y, data_struct.z},
+                                     {half_steps_x, half_steps_y, half_steps_z})/2;
+                data_struct.amount = 0.0f;
+                proc_node.m_data_nodes[idx].m_data = data_struct;
+                
+                //count up number of neighbors
+                proc_node.m_data_nodes[idx].m_num_neighbors = 0;
+                for(int dx = -1; dx <= 1; dx++){
+                    for(int dy = -1; dy <= 1; dy++){
+                        for(int dz = -1; dz <= 1; dz++){
+                            int nz = 0;
+                            if(dx == 0) nz++;
+                            if(dy == 0) nz++;
+                            if(dz == 0) nz++;
+                            if(nz == 1){
+                                Point3D new_point = {proc_node.m_data_nodes[idx].m_data.x + dx,
+                                                     proc_node.m_data_nodes[idx].m_data.y + dy,
+                                                     proc_node.m_data_nodes[idx].m_data.z + dz};
+                                Point3D local = {new_point.x - rank.coords_sim_space.x,
+                                                 new_point.y - rank.coords_sim_space.y,
+                                                 new_point.z - rank.coords_sim_space.z};
+                                if(inBounds(local, rank.my_half_steps)){
+                                    proc_node.m_data_nodes[idx].m_num_neighbors++;
                                 }
                             }
                         }
                     }
-                    //set neighbors
-                    //TODO: Properly free the m_neighbors list!!!
-                    proc_node.m_data_nodes[idx].m_neighbors = new DataNode<FCCDiffuser>*[proc_node.m_data_nodes[idx].m_num_neighbors];
-                    int temp = 0;
-                    std::vector<int> proc_neighbors;
-                    for(int dx = -1; dx <= 1; dx++){
-                        for(int dy = -1; dy <= 1; dy++){
-                            for(int dz = -1; dz <= 1; dz++){
-                                int nz = 0;
-                                if(dx == 0) nz++;
-                                if(dy == 0) nz++;
-                                if(dz == 0) nz++;
-                                if(nz == 1){
-                                    Point3D new_point = {proc_node.m_data_nodes[idx].m_data.x + dx,
-                                                         proc_node.m_data_nodes[idx].m_data.y + dy,
-                                                         proc_node.m_data_nodes[idx].m_data.z + dz};
-                                    Point3D local = {new_point.x - rank.coords_sim_space.x,
-                                                     new_point.y - rank.coords_sim_space.y,
-                                                     new_point.z - rank.coords_sim_space.z};
-                                    if(inBounds(local, rank.my_half_steps)){
-                                        int nbr_idx = to1D(local, rank.my_half_steps)/2;
-                                        proc_node.m_data_nodes[idx].m_neighbors[temp] = &proc_node.m_data_nodes[nbr_idx];
-                                        temp++;
-                                        //TODO: if the neighbor is a ghost, compute the process that owns the neighbor and add it
-                                        //to proc_neighbors
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    //TODO: build the pack_map and unpack_map here
-                    //if it is a ghost, figure out which process owns it, add it to the corresponding unpack vector
-                    //if it has ghost neighbors, go through its proc_neighbors vector and add it to the corresponding pack vector
-                    //Does this work? Think about the order that each process will build up the vectors, do they align correctly?
-
-                    //TODO compute node_rank -> the node that owns this node if it is a ghost
-                    if(proc_node.m_data_nodes[idx].m_ghost){
-                        proc_node.m_unpack_map.at(node_rank).push_back(idx); //TODO these vectors might not exist yet
-                    }
-                    for(unsigned int zz = 0; zz < proc_neighbors.size(); zz++){
-                        proc_node.m_pack_map.at(proc_neighbors[zz]).push_back(idx);
-                    }
-                    //TODO: Compute m_packed_data_sizes and m_neighbor_data_sizes
-                    //TODO: implement the above TODOs and test
-
-
-                    idx++;
                 }
+                //set neighbors
+                //TODO: Properly free the m_neighbors list!!!
+                proc_node.m_data_nodes[idx].m_neighbors = new DataNode<FCCDiffuser>*[proc_node.m_data_nodes[idx].m_num_neighbors];
+                int temp = 0;
+                std::vector<int> proc_neighbors;
+                for(int dx = -1; dx <= 1; dx++){
+                    for(int dy = -1; dy <= 1; dy++){
+                        for(int dz = -1; dz <= 1; dz++){
+                            int nz = 0;
+                            if(dx == 0) nz++;
+                            if(dy == 0) nz++;
+                            if(dz == 0) nz++;
+                            if(nz == 1){
+                                Point3D new_point = {proc_node.m_data_nodes[idx].m_data.x + dx,
+                                                     proc_node.m_data_nodes[idx].m_data.y + dy,
+                                                     proc_node.m_data_nodes[idx].m_data.z + dz};
+                                Point3D local = {new_point.x - rank.coords_sim_space.x,
+                                                 new_point.y - rank.coords_sim_space.y,
+                                                 new_point.z - rank.coords_sim_space.z};
+                                if(inBounds(local, rank.my_half_steps)){
+                                    int nbr_idx = to1D(local, rank.my_half_steps)/2;
+                                    proc_node.m_data_nodes[idx].m_neighbors[temp] = &proc_node.m_data_nodes[nbr_idx];
+                                    temp++;
+                                    //TODO: if the neighbor is a ghost, compute the process that owns the neighbor and add it
+                                    //to proc_neighbors
+                                }
+                            }
+                        }
+                    }
+                }
+                //TODO: build the pack_map and unpack_map here
+                //if it is a ghost, figure out which process owns it, add it to the corresponding unpack vector
+                //if it has ghost neighbors, go through its proc_neighbors vector and add it to the corresponding pack vector
+                //Does this work? Think about the order that each process will build up the vectors, do they align correctly?
+
+                //TODO compute node_rank -> the node that owns this node if it is a ghost
+                if(proc_node.m_data_nodes[idx].m_ghost){
+                    proc_node.m_unpack_map.at(node_rank).push_back(idx); //TODO these vectors might not exist yet
+                }
+                for(unsigned int zz = 0; zz < proc_neighbors.size(); zz++){
+                    proc_node.m_pack_map.at(proc_neighbors[zz]).push_back(idx);
+                }
+                //TODO: Compute m_packed_data_sizes and m_neighbor_data_sizes
+                //TODO: implement the above TODOs and test
+
+
+                idx++;
                 evenZ = !evenZ;
             }
             evenY = !evenY;
