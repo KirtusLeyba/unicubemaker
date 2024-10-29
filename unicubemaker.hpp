@@ -73,14 +73,14 @@ template <typename T> void ProcessNode<T>::packData(){
 }
 
 template <typename T> void ProcessNode<T>::recvAndUnpack(){
-    std::unordered_map<int, DataNode<T>*> recv_data;
+    std::unordered_map<int, upcxx::global_ptr<DataNode<T>>> recv_data;
     
     //receive data from neighbors
     upcxx::future<> future_all = upcxx::make_future();
     for(auto pair : m_neighbor_data){
         int process_id = pair.first;
-        DataNode<T>* temp_recv = new DataNode<T>[m_neighbor_data_sizes.at(process_id)];
-        upcxx::future<> f = upcxx::copy(m_neighbor_data.at(process_id), temp_recv);
+        upcxx::global_ptr<DataNode<T>> temp_recv = upcxx::new_array<DataNode<T>>(m_neighbor_data_sizes.at(process_id));
+        upcxx::future<> f = upcxx::copy(m_neighbor_data.at(process_id), temp_recv, m_neighbor_data_sizes.at(process_id));
         future_all = upcxx::when_all(future_all, f);
         recv_data[process_id] = temp_recv;
     }
@@ -89,13 +89,13 @@ template <typename T> void ProcessNode<T>::recvAndUnpack(){
     //unpack recv_data
     for(auto pair : m_unpack_map){
         int process_id = pair.first;
-        for(unsigned int i = 0; i < pair.second.size(); i++){
-            m_data_nodes[pair.second[i]].m_data = recv_data[process_id][i].m_data;
+        for(unsigned int i = 0; i < m_neighbor_data_sizes.at(process_id); i++){
+            m_data_nodes[pair.second[i]].m_data = recv_data.at(process_id).local()[i].m_data;
         }
     }
 
     //clear temp memory
     for(auto pair : recv_data){
-        delete[] pair.second;
+        upcxx::delete_array(pair.second);
     }
 }

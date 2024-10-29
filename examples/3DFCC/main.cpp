@@ -8,6 +8,8 @@
 #include <string>
 #include <sstream>
 #include <unordered_map>
+#include <boost/functional/hash.hpp>
+#include <set>
 
 struct Point3D {
     int x;
@@ -20,15 +22,26 @@ Point3D to3D(int i, Point3D dims){
     int z  =(i % (dims.z*dims.y)) % dims.z;
     return {x, y, z};
 }
-
 int to1D(Point3D p, Point3D dims){
     return p.z + p.y*dims.z + p.x*(dims.y*dims.z);
 }
-bool inBounds(Point3D pos, Point3D dims){
-    if(pos.x >= dims.x || pos.x < 0) return false;
-    if(pos.y >= dims.y || pos.y < 0) return false;
-    if(pos.z >= dims.z || pos.z < 0) return false;
+
+//within boundary e.g. x in [min, max)
+bool inBounds(Point3D p, Point3D min, Point3D max){
+    if(p.x >= max.x || p.x < min.x) return false;
+    if(p.y >= max.y || p.y < min.y) return false;
+    if(p.z >= max.z || p.z < min.z) return false;
     return true;
+}
+
+int getRankOwner(Point3D p, Point3D half_steps_per_rank, Point3D rank_dims){
+    int rx = p.x / half_steps_per_rank.x;
+    if(rx >= rank_dims.x) rx = rank_dims.x - 1;
+    int ry = p.y / half_steps_per_rank.y;
+    if(ry >= rank_dims.y) ry = rank_dims.y - 1;
+    int rz = p.z / half_steps_per_rank.z;
+    if(rz >= rank_dims.z) rz = rank_dims.z - 1;
+    return to1D({rx, ry, rz}, rank_dims);
 }
 
 struct FCCDiffuser {
@@ -38,44 +51,6 @@ struct FCCDiffuser {
     int i;
     float amount;
 };
-
-struct Rank {
-    Point3D my_half_steps;
-    Point3D coords_rank_space;
-    Point3D coords_sim_space;
-    bool prevX;
-    bool nextX;
-    bool prevY;
-    bool nextY;
-    bool prevZ;
-    bool nextZ;
-    int num_local_cells;
-};
-
-int localCoordsToGlobalIDX(Point3D local_coords,
-                        Point3D local_dims,
-                        Point3D sim_dims,
-                        Rank rank){
-    Point3D global_coords;
-
-    int rank_offset_x = rank.coords_sim_space.x;
-    int rank_offset_y = rank.coords_sim_space.y;
-    int rank_offset_z = rank.coords_sim_space.z;
-
-    global_coords.x = local_coords.x + rank_offset_x;
-    global_coords.y = local_coords.y + rank_offset_y;
-    global_coords.z = local_coords.z + rank_offset_z;
-
-    return to1D(global_coords, sim_dims)/2;
-}
-
-int globalCoordstoRank(Point3D global_coords, Point3D half_steps_per_rank, Point3D rank_dims, Point3D sim_dims){
-    Point3D proc_coords = {global_coords.x / half_steps_per_rank.x,
-                            global_coords.y / half_steps_per_rank.y,
-                            global_coords.z / half_steps_per_rank.z};
-    return to1D(proc_coords, rank_dims);   
-}
-
 
 bool isPoint(bool evenX, bool evenY, bool evenZ){
     if(evenZ){
@@ -107,124 +82,135 @@ int main(int argc, char** argv){
 
     //Using FCC 3D with empty boundaries
     //global spatial information
-    int half_steps_x = 7;
-    int half_steps_y = 7;
-    int half_steps_z = 7;
-    Point3D sim_dims = {half_steps_x, half_steps_y, half_steps_z};
+    Point3D sim_dims = {8, 8, 8};
     int num_ranks = upcxx::rank_n();
-    Point3D rank_dims = {2, 2, 2};
+    Point3D rank_dims = {2, 1, 1};
 
-    Rank rank;
-    rank.prevX = false;
-    rank.nextX = false;
-    rank.prevY = false;
-    rank.nextY = false;
-    rank.prevZ = false;
-    rank.nextZ = false;
-    Point3D half_steps_per_rank = { half_steps_x / rank_dims.x,
-                                    half_steps_y / rank_dims.y,
-                                    half_steps_z / rank_dims.z };
-    rank.my_half_steps = {  half_steps_per_rank.x,
+    bool prevX = false;
+    bool nextX = false;
+    bool prevY = false;
+    bool nextY = false;
+    bool prevZ = false;
+    bool nextZ = false;
+    Point3D half_steps_per_rank = { sim_dims.x / rank_dims.x,
+                                    sim_dims.y / rank_dims.y,
+                                    sim_dims.z / rank_dims.z };
+    Point3D my_half_steps = { half_steps_per_rank.x,
                             half_steps_per_rank.y,
                             half_steps_per_rank.z};
-    rank.coords_rank_space = to3D(upcxx::rank_me(), rank_dims);
-    rank.coords_sim_space = {rank.coords_rank_space.x*half_steps_per_rank.x,
-                             rank.coords_rank_space.y*half_steps_per_rank.y,
-                             rank.coords_rank_space.z*half_steps_per_rank.z};
-    if(rank.coords_rank_space.x == rank_dims.x - 1) rank.my_half_steps.x += half_steps_x % rank_dims.x;
-    if(rank.coords_rank_space.y == rank_dims.y - 1) rank.my_half_steps.y += half_steps_y % rank_dims.y;
-    if(rank.coords_rank_space.z == rank_dims.z - 1) rank.my_half_steps.z += half_steps_z % rank_dims.z;
+    Point3D coords_rank_space = to3D(upcxx::rank_me(), rank_dims);
+    Point3D coords_sim_space_start = {coords_rank_space.x*half_steps_per_rank.x,
+                                      coords_rank_space.y*half_steps_per_rank.y,
+                                      coords_rank_space.z*half_steps_per_rank.z};
+    if(coords_rank_space.x == rank_dims.x - 1) my_half_steps.x += sim_dims.x % rank_dims.x;
+    if(coords_rank_space.y == rank_dims.y - 1) my_half_steps.y += sim_dims.y % rank_dims.y;
+    if(coords_rank_space.z == rank_dims.z - 1) my_half_steps.z += sim_dims.z % rank_dims.z;
+    Point3D coords_sim_space_end = {coords_sim_space_start.x + my_half_steps.x,
+                                    coords_sim_space_start.y + my_half_steps.y,
+                                    coords_sim_space_start.z + my_half_steps.z};
 
-    if(rank.coords_rank_space.x > 0){
-        rank.coords_sim_space.x -= 1;
-        rank.my_half_steps.x += 1;
-        rank.prevX = true;
-    }
-    if(rank.coords_rank_space.x < rank_dims.x - 1){
-        rank.my_half_steps.x += 1;
-        rank.nextX = true;
-    }
 
-    if(rank.coords_rank_space.y > 0){
-        rank.coords_sim_space.y -= 1;
-        rank.my_half_steps.y += 1;
-        rank.prevY = true;
+    if(coords_rank_space.x > 0){
+        prevX = true;
+        coords_sim_space_start.x -= 1;
     }
-    if(rank.coords_rank_space.y < rank_dims.y - 1){
-        rank.my_half_steps.y += 1;
-        rank.nextY = true;
+    if(coords_rank_space.x < rank_dims.x - 1){
+        nextX = true;
+        coords_sim_space_end.x += 1;
     }
 
-    if(rank.coords_rank_space.z > 0){
-        rank.coords_sim_space.z -= 1;
-        rank.my_half_steps.z += 1;
-        rank.prevZ = true;
+    if(coords_rank_space.y > 0){
+        prevY = true;
+        coords_sim_space_start.y -= 1;
     }
-    if(rank.coords_rank_space.z < rank_dims.z - 1){
-        rank.my_half_steps.z += 1;
-        rank.nextZ = true;
+    if(coords_rank_space.y < rank_dims.y - 1){
+        nextY = true;
+        coords_sim_space_end.y += 1;
     }
 
-    //first compute the number of local cells
-    //TODO: Figure out how to do this more intelligently
-    bool source_evenX = (rank.coords_sim_space.x % 2 == 0);
-    bool source_evenY = (rank.coords_sim_space.y % 2 == 0);
-    bool source_evenZ = (rank.coords_sim_space.z % 2 == 0);
-    bool evenX = source_evenX;
-    bool evenY = source_evenY;
-    bool evenZ = source_evenZ;
-    rank.num_local_cells = 0;
-    for(int i = 0; i < rank.my_half_steps.x; i++){
-        for(int j = 0; j < rank.my_half_steps.y; j++){
-            for(int k = 0; k < rank.my_half_steps.z; k++){
+    if(coords_rank_space.z > 0){
+        prevZ = true;
+        coords_sim_space_start.z -= 1;
+    }
+    if(coords_rank_space.z < rank_dims.z - 1){
+        nextZ = true;
+        coords_sim_space_end.z += 1;
+    }
+
+    bool evenX = true;
+    bool evenY = true;
+    bool evenZ = true;
+    int num_local_cells = 0;
+    std::unordered_map<int, Point3D> idx_to_xyz;
+    std::unordered_map< std::tuple<int, int, int>,
+                        int,
+                        boost::hash<std::tuple<int, int, int>> > xyz_to_idx;
+    std::unordered_map<int, int> global_to_local;
+    int idx = 0;
+    int local_idx = 0;
+    for(int i = 0; i < sim_dims.x; i++){
+        for(int j = 0; j < sim_dims.y; j++){
+            for(int k = 0; k < sim_dims.z; k++){
                 if(isPoint(evenX, evenY, evenZ)){
-                    rank.num_local_cells++;
+                    if(inBounds({i, j, k}, coords_sim_space_start, coords_sim_space_end)){
+                        num_local_cells++;
+                        idx_to_xyz[idx] = {i, j, k};
+                        xyz_to_idx[std::make_tuple(i, j, k)] = idx;
+                        global_to_local[idx] = local_idx;
+                        local_idx += 1;
+                    }
+                    idx += 1;
                 }
                 evenZ = !evenZ;
             }
             evenY = !evenY;
-            evenZ = source_evenZ;
+            evenZ = true;
         }
         evenX = !evenX;
-        evenY = source_evenY;
-        evenZ = source_evenZ;
+        evenY = true;
+        evenZ = true;
     }
-    evenX = source_evenX;
-    evenY = source_evenY;
-    evenZ = source_evenZ;
+    evenX = true;
+    evenY = true;
+    evenZ = true;
 
     //initialize our local process node
     ProcessNode<FCCDiffuser> proc_node;
-    proc_node.m_data_nodes = new DataNode<FCCDiffuser>[rank.num_local_cells];
-
-    int idx = 0;
-    for(int i = 0; i < rank.my_half_steps.x; i++){
-        for(int j = 0; j < rank.my_half_steps.y; j++){
-            for(int k = 0; k < rank.my_half_steps.z; k++){
+    proc_node.m_data_nodes = new DataNode<FCCDiffuser>[num_local_cells];
+    idx = 0;
+    local_idx = 0;
+    int ghosts_seen = 0;
+    for(int i = 0; i < sim_dims.x; i++){
+        for(int j = 0; j < sim_dims.y; j++){
+            for(int k = 0; k < sim_dims.z; k++){
                 bool ghost = false;
-                if(i == 0 && rank.prevX) ghost = true;
-                if(j == 0 && rank.prevY) ghost = true;
-                if(k == 0 && rank.prevZ) ghost = true;
-                if(i == rank.my_half_steps.x-1 && rank.nextX) ghost = true;
-                if(j == rank.my_half_steps.y-1 && rank.nextY) ghost = true;
-                if(k == rank.my_half_steps.z-1 && rank.nextZ) ghost = true;
-                if(!isPoint(evenX, evenY, evenZ)){
-                    idx++;
+                if(i == coords_sim_space_start.x && prevX) ghost = true;
+                if(j == coords_sim_space_start.y && prevY) ghost = true;
+                if(k == coords_sim_space_start.z && prevZ) ghost = true;
+                if(i == coords_sim_space_end.x-1 && nextX) ghost = true;
+                if(j == coords_sim_space_end.y-1 && nextY) ghost = true;
+                if(k == coords_sim_space_end.z-1 && nextZ) ghost = true;
+
+                if(!inBounds({i, j, k}, coords_sim_space_start, coords_sim_space_end)){
+                    if(isPoint(evenX, evenY, evenZ)) idx++;
                     evenZ = !evenZ;
                     continue;
                 }
-                proc_node.m_data_nodes[idx].m_ghost = ghost;
+                if(!isPoint(evenX, evenY, evenZ)){
+                    evenZ = !evenZ;
+                    continue;
+                }
+                proc_node.m_data_nodes[local_idx].m_ghost = ghost;
                 FCCDiffuser data_struct;
-                data_struct.x = rank.coords_sim_space.x + i;
-                data_struct.y = rank.coords_sim_space.y + j;
-                data_struct.z = rank.coords_sim_space.z + k;
-                data_struct.i = to1D({data_struct.x, data_struct.y, data_struct.z},
-                                     {half_steps_x, half_steps_y, half_steps_z})/2;
+                data_struct.x = i;
+                data_struct.y = j;
+                data_struct.z = k;
+                data_struct.i = xyz_to_idx.at(std::make_tuple(i, j, k));
                 data_struct.amount = 0.0f;
-                proc_node.m_data_nodes[idx].m_data = data_struct;
-                
+                proc_node.m_data_nodes[local_idx].m_data = data_struct;
+
                 //count up number of neighbors
-                proc_node.m_data_nodes[idx].m_num_neighbors = 0;
+                proc_node.m_data_nodes[local_idx].m_num_neighbors = 0;
                 for(int dx = -1; dx <= 1; dx++){
                     for(int dy = -1; dy <= 1; dy++){
                         for(int dz = -1; dz <= 1; dz++){
@@ -233,14 +219,11 @@ int main(int argc, char** argv){
                             if(dy == 0) nz++;
                             if(dz == 0) nz++;
                             if(nz == 1){
-                                Point3D new_point = {proc_node.m_data_nodes[idx].m_data.x + dx,
-                                                     proc_node.m_data_nodes[idx].m_data.y + dy,
-                                                     proc_node.m_data_nodes[idx].m_data.z + dz};
-                                Point3D local = {new_point.x - rank.coords_sim_space.x,
-                                                 new_point.y - rank.coords_sim_space.y,
-                                                 new_point.z - rank.coords_sim_space.z};
-                                if(inBounds(local, rank.my_half_steps)){
-                                    proc_node.m_data_nodes[idx].m_num_neighbors++;
+                                Point3D new_point = {proc_node.m_data_nodes[local_idx].m_data.x + dx,
+                                                     proc_node.m_data_nodes[local_idx].m_data.y + dy,
+                                                     proc_node.m_data_nodes[local_idx].m_data.z + dz};
+                                if(inBounds(new_point, coords_sim_space_start, coords_sim_space_end)){
+                                    proc_node.m_data_nodes[local_idx].m_num_neighbors++;
                                 }
                             }
                         }
@@ -248,9 +231,9 @@ int main(int argc, char** argv){
                 }
                 //set neighbors
                 //TODO: Properly free the m_neighbors list!!!
-                proc_node.m_data_nodes[idx].m_neighbors = new DataNode<FCCDiffuser>*[proc_node.m_data_nodes[idx].m_num_neighbors];
+                proc_node.m_data_nodes[local_idx].m_neighbors = new DataNode<FCCDiffuser>*[proc_node.m_data_nodes[local_idx].m_num_neighbors];
                 int temp = 0;
-                std::vector<int> proc_neighbors;
+                std::set<int> proc_neighbors;
                 for(int dx = -1; dx <= 1; dx++){
                     for(int dy = -1; dy <= 1; dy++){
                         for(int dz = -1; dz <= 1; dz++){
@@ -259,134 +242,144 @@ int main(int argc, char** argv){
                             if(dy == 0) nz++;
                             if(dz == 0) nz++;
                             if(nz == 1){
-                                Point3D new_point = {proc_node.m_data_nodes[idx].m_data.x + dx,
-                                                     proc_node.m_data_nodes[idx].m_data.y + dy,
-                                                     proc_node.m_data_nodes[idx].m_data.z + dz};
-                                Point3D local = {new_point.x - rank.coords_sim_space.x,
-                                                 new_point.y - rank.coords_sim_space.y,
-                                                 new_point.z - rank.coords_sim_space.z};
-                                if(inBounds(local, rank.my_half_steps)){
-                                    int nbr_idx = to1D(local, rank.my_half_steps)/2;
-                                    proc_node.m_data_nodes[idx].m_neighbors[temp] = &proc_node.m_data_nodes[nbr_idx];
+                                Point3D new_point = {proc_node.m_data_nodes[local_idx].m_data.x + dx,
+                                                     proc_node.m_data_nodes[local_idx].m_data.y + dy,
+                                                     proc_node.m_data_nodes[local_idx].m_data.z + dz};
+                                if(inBounds(new_point, coords_sim_space_start, coords_sim_space_end)){
+                                    int nbr_global_idx = xyz_to_idx.at(std::make_tuple(new_point.x,
+                                                                                       new_point.y,
+                                                                                       new_point.z));
+                                    int nbr_idx = global_to_local.at(nbr_global_idx);
+                                    proc_node.m_data_nodes[local_idx].m_neighbors[temp] = &proc_node.m_data_nodes[nbr_idx];
                                     temp++;
                                     bool nb_ghost = false;
-                                    if(local.x == 0 && rank.prevX) nb_ghost = true;
-                                    if(local.y == 0 && rank.prevY) nb_ghost = true;
-                                    if(local.z == 0 && rank.prevZ) nb_ghost = true;
-                                    if(local.x == rank.my_half_steps.x-1 && rank.nextX) nb_ghost = true;
-                                    if(local.y == rank.my_half_steps.y-1 && rank.nextY) nb_ghost = true;
-                                    if(local.z == rank.my_half_steps.z-1 && rank.nextZ) nb_ghost = true;
-                                    if(nb_ghost){
-                                        int global_idx = localCoordsToGlobalIDX(local,
-                                                                            rank.my_half_steps,
-                                                                            sim_dims,
-                                                                            rank);
-                                        Point3D global_coords = {rank.coords_sim_space.x + local.x,
-                                                                rank.coords_sim_space.y + local.y,
-                                                                rank.coords_sim_space.z + local.z};
-                                        int owner_rank = globalCoordstoRank(global_coords,
-                                                                        half_steps_per_rank,
-                                                                        rank_dims, sim_dims);
-                                        proc_neighbors.push_back(owner_rank);
+                                    if(new_point.x == coords_sim_space_start.x && prevX) nb_ghost = true;
+                                    if(new_point.y == coords_sim_space_start.y && prevY) nb_ghost = true;
+                                    if(new_point.z == coords_sim_space_start.z && prevZ) nb_ghost = true;
+                                    if(new_point.x == coords_sim_space_end.x-1 && nextX) nb_ghost = true;
+                                    if(new_point.y == coords_sim_space_end.y-1 && nextY) nb_ghost = true;
+                                    if(new_point.z == coords_sim_space_end.z-1 && nextZ) nb_ghost = true;
+                                    if(nb_ghost && !ghost){
+                                        int owner_rank = getRankOwner(new_point, half_steps_per_rank, rank_dims);
+                                        proc_neighbors.insert(owner_rank);
                                     }
                                 }
                             }
                         }
                     }
                 }
-                for(unsigned int zz = 0; zz < proc_neighbors.size(); zz++){
-                    if(upcxx::rank_me() == 0) std::cout << proc_neighbors[zz] << std::endl;
-                    int proc_id = proc_neighbors[zz];
-                    if(proc_node.m_pack_map.count(proc_id) == 0){
-                        proc_node.m_pack_map.insert( std::make_pair( proc_id, std::vector<int>() ) );
+                if(!ghost){
+                    for(const int &proc_id : proc_neighbors){
+                        if(proc_node.m_pack_map.count(proc_id) == 0){
+                            proc_node.m_pack_map.insert( std::make_pair( proc_id, std::vector<int>() ) );
+                        }
+                        proc_node.m_pack_map.at(proc_id).push_back(local_idx);
                     }
-                    proc_node.m_pack_map.at(proc_id).push_back(idx);
                 }
 
-                if(proc_node.m_data_nodes[idx].m_ghost){
-                    int global_idx = localCoordsToGlobalIDX({i, j, k},
-                                                        rank.my_half_steps,
-                                                        sim_dims,
-                                                        rank);
-                    Point3D global_coords = {rank.coords_sim_space.x + i,
-                                            rank.coords_sim_space.y + j,
-                                            rank.coords_sim_space.z + k};
-                    int owner_rank = globalCoordstoRank(global_coords,
-                                                    half_steps_per_rank,
-                                                    rank_dims, sim_dims);
+                if(proc_node.m_data_nodes[local_idx].m_ghost){
+                    int owner_rank = getRankOwner(idx_to_xyz.at(idx), half_steps_per_rank, rank_dims);
                     if(proc_node.m_unpack_map.count(owner_rank) == 0){
                         proc_node.m_unpack_map.insert( std::make_pair( owner_rank, std::vector<int>() ) );
                     }
-                    proc_node.m_unpack_map.at(owner_rank).push_back(idx);
+                    proc_node.m_unpack_map.at(owner_rank).push_back(local_idx);
                 }
+                local_idx++;
                 idx++;
                 evenZ = !evenZ;
             }
             evenY = !evenY;
-            evenZ = source_evenZ;
+            evenZ = true;
         }
         evenX = !evenX;
-        evenY = source_evenY;
-        evenZ = source_evenZ;
+        evenY = true;
+        evenZ = true;
     }
-    evenX = source_evenX;
-    evenY = source_evenY;
-    evenZ = source_evenZ;
+    evenX = true;
+    evenY = true;
+    evenZ = true;
 
-    // //get the sizes of packed data
-    // for(auto pair : proc_node.m_pack_map){
-    //     int proc_id = pair.first;
-    //     proc_node.m_packed_data_sizes[proc_id] = pair.second.size();
-    // }
 
     //this is how to set the amount in a cell with global coordinates
     Point3D setPoint = {6, 6 ,6};
-    Point3D localSetPoint = {setPoint.x - rank.coords_sim_space.x,
-                             setPoint.y - rank.coords_sim_space.y,
-                             setPoint.x - rank.coords_sim_space.z};
-    if(inBounds(localSetPoint, rank.my_half_steps)){
-        int idx = to1D(localSetPoint, rank.my_half_steps)/2;
+    if(inBounds(setPoint, coords_sim_space_start, coords_sim_space_end)){
+        int idx = global_to_local.at(xyz_to_idx.at(std::make_tuple(setPoint.x, setPoint.y, setPoint.z)));
         proc_node.m_data_nodes[idx].m_data.amount = 10000.0f;
     }
 
-    //write the topology to file for inspection
+    //setup comms network
+    for(auto it : proc_node.m_pack_map){
+        int proc_id = it.first;
+        std::vector<int> locations = it.second;
+        proc_node.m_packed_data[proc_id] = upcxx::new_array<DataNode<FCCDiffuser>>(locations.size());
+        proc_node.m_packed_data_sizes[proc_id] = locations.size();
+    }
+
+    upcxx::barrier();
+    proc_node.bcastGPTRs();
+    upcxx::barrier();
+    for(int i = 0; i < upcxx::rank_n(); i++){
+        if(upcxx::rank_me() == i){
+            std::cout << "rank: " << upcxx::rank_me() << std::endl;
+            std::cout << "ghosts = " << ghosts_seen << std::endl;
+            std::cout << "printing m_neighbor_data" << std::endl;
+            for(auto it : proc_node.m_neighbor_data){
+                int size = proc_node.m_neighbor_data_sizes.at(it.first);
+                std::cout << it.first << ": " << it.second << " " << size << std::endl;
+            }
+            std::cout << "printing m_unpack_map" << std::endl;
+            for(auto it : proc_node.m_unpack_map){
+                std::cout << it.first << ": " << it.second.size() << std::endl;
+            }
+            std::cout << "printing m_pack_map" << std::endl;
+            for(auto it : proc_node.m_pack_map){
+                std::cout << it.first << ": " << it.second.size() << std::endl;
+            }
+        }
+        upcxx::barrier();
+    }
+
+    //run a diffusion simulation
     //write output to file
     std::stringstream outputFileStream;
     outputFileStream << "./output/" << upcxx::rank_me() << "_log.csv";
     std::ofstream outputFile;
     outputFile.open(outputFileStream.str());
-    outputFile << "x,y,z,i,ghost,nbrs" << std::endl;
-    for(int i = 0; i < rank.num_local_cells; i++){
-        FCCDiffuser fccData = proc_node.m_data_nodes[i].m_data;
-        DataNode<FCCDiffuser> dnode = proc_node.m_data_nodes[i];
-        int global_idx = localCoordsToGlobalIDX({fccData.x, fccData.y, fccData.z},
-                                            rank.my_half_steps,
-                                            sim_dims,
-                                            rank);
-        Point3D point = {rank.coords_sim_space.x + fccData.x,
-                        rank.coords_sim_space.y + fccData.y,
-                        rank.coords_sim_space.z + fccData.z};
-        outputFile << point.x << ",";
-        outputFile << point.y << ",";
-        outputFile << point.z << ",";
-        outputFile << global_idx << ",";
-        outputFile << dnode.m_ghost << ",";
+    outputFile << "it,x,y,z,i,amount,ghost" << std::endl;
+    int num_steps = 10000;
+    float D = 0.01;
+    for(int ts = 0; ts < num_steps; ts++){
+        DataNode<FCCDiffuser>* new_data = new DataNode<FCCDiffuser>[num_local_cells];
 
-        for(int j = 0; j < dnode.m_num_neighbors - 1; j++){
-            int nbr_global_idx = localCoordsToGlobalIDX({dnode.m_neighbors[j]->m_data.x,
-                                                        dnode.m_neighbors[j]->m_data.y,
-                                                        dnode.m_neighbors[j]->m_data.z}, rank.my_half_steps, sim_dims, rank);
-            outputFile << nbr_global_idx << "|";
+        //diffusion
+        for(int i = 0; i < num_local_cells; i++){
+            DataNode<FCCDiffuser>* dn = &(proc_node.m_data_nodes[i]);
+            if(dn->m_ghost) continue;
+            new_data[i].m_data = dn->m_data;
+            for(int j = 0; j < dn->m_num_neighbors; j++){
+                new_data[i].m_data.amount += D*dn->m_neighbors[j]->m_data.amount;
+            }
+            new_data[i].m_data.amount -= D*(float)dn->m_num_neighbors*dn->m_data.amount;
         }
-        if(dnode.m_num_neighbors > 0){
-            int nbr_global_idx = localCoordsToGlobalIDX({dnode.m_neighbors[dnode.m_num_neighbors - 1]->m_data.x,
-                                            dnode.m_neighbors[dnode.m_num_neighbors - 1]->m_data.y,
-                                            dnode.m_neighbors[dnode.m_num_neighbors - 1]->m_data.z}, rank.my_half_steps, sim_dims, rank);
-            outputFile << nbr_global_idx;
+        //swap vectors
+        for(int i = 0; i < num_local_cells; i++){
+            proc_node.m_data_nodes[i].m_data = new_data[i].m_data;
+            outputFile << ts << "," << new_data[i].m_data.x << "," <<
+                                        new_data[i].m_data.y << "," <<
+                                        new_data[i].m_data.z << "," <<
+                                        new_data[i].m_data.i << "," <<
+                                        new_data[i].m_data.amount << "," <<
+                                        new_data[i].m_ghost << std::endl;
         }
-        outputFile << std::endl;
+        delete[] new_data;
+
+        //communicate
+        proc_node.packData();
+        upcxx::barrier();
+        proc_node.recvAndUnpack();
 
     }
+    outputFile.close();
 
     // memory clean up
     delete[] proc_node.m_data_nodes;
